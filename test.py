@@ -2,11 +2,15 @@ import random
 import webbrowser
 import pyttsx3
 import speech_recognition as sr
-from llama_cpp import Llama
+from transformers import pipeline
 import os
 import json
 from typing import Optional, Dict, Any
 from datetime import datetime
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+import pickle
 
 class Config:
     @staticmethod
@@ -46,45 +50,87 @@ class SpeechHandler:
                 print(f"Error with the speech recognition service: {e}")
                 return ""
 
-class LlamaHandler:
-    def __init__(self, model_path: str):
-        """Initialize Llama model."""
+class HuggingFaceHandler:
+    def __init__(self):
+        """Initialize the Hugging Face text generation pipeline."""
         try:
-            self.llm = Llama(
-                model_path=model_path,
-                n_ctx=2048,  # Context window
-                n_threads=4   # Number of CPU threads to use
-            )
+            self.generator = pipeline("text2text-generation", model="google/flan-t5-large")
+            self.conversation_context = []  # Maintain conversation history
         except Exception as e:
-            raise Exception(f"Failed to initialize Llama model: {e}")
+            raise Exception(f"Failed to initialize Hugging Face model: {e}")
 
-    def generate_response(self, prompt: str, system_message: str = "You are a helpful assistant.") -> str:
-        """Generate response using Llama."""
+    def generate_response(self, user_input: str) -> str:
+        """Generate conversational response with history."""
         try:
-            # Format the prompt similar to ChatML format
-            formatted_prompt = f"""<|im_start|>system
-{system_message}<|im_end|>
-<|im_start|>user
-{prompt}<|im_end|>
-<|im_start|>assistant"""
-            
-            response = self.llm(
-                formatted_prompt,
-                max_tokens=512,
-                stop=["<|im_end|>"],
-                echo=False
-            )
-            
+            # Add the user's input to the context
+            self.conversation_context.append(f"User: {user_input}")
+
+            # Build the prompt with context
+            context = "\n".join(self.conversation_context[-5:])  # Use the last 5 exchanges for brevity
+            prompt = f"The following is a conversation between a helpful assistant and a user:\n{context}\nAssistant:"
+
+            # Generate a response
+            response = self.generator(prompt, max_length=200, num_return_sequences=1)
+
             # Extract the generated text
-            return response['choices'][0]['text'].strip()
+            bot_response = response[0]["generated_text"].strip()
+
+            # Add the assistant's response to the context
+            self.conversation_context.append(f"Assistant: {bot_response}")
+
+            return bot_response
         except Exception as e:
             print(f"Error generating response: {e}")
             return "I apologize, but I encountered an error processing your request."
 
-    def summarize_email(self, email_content: str) -> str:
-        """Summarize email content."""
-        prompt = f"Summarize the following email concisely: {email_content}"
-        return self.generate_response(prompt)
+    def summarize_email(self, email_content: str, sender: str) -> str:
+        """Summarize email content and include sender information."""
+        prompt = f"Summarize the following email from {sender} concisely: {email_content}"
+        response = self.generator(prompt, max_length=100, num_return_sequences=1)
+        return response[0]["generated_text"].strip()
+
+class GmailHandler:
+    SCOPES = ['https://www.googleapis.com/auth/gmail.readonly']
+
+    def __init__(self):
+        """Initialize Gmail API."""
+        self.service = self.authenticate_gmail()
+
+    def authenticate_gmail(self):
+        """Authenticate Gmail API."""
+        creds = None
+        if os.path.exists('token.pickle'):
+            with open('token.pickle', 'rb') as token:
+                creds = pickle.load(token)
+
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', self.SCOPES)
+                creds = flow.run_local_server(port=0)
+
+            with open('token.pickle', 'wb') as token:
+                pickle.dump(creds, token)
+
+        return build('gmail', 'v1', credentials=creds)
+
+    def fetch_last_email(self):
+        """Fetch the latest email."""
+        try:
+            results = self.service.users().messages().list(userId='me', maxResults=1).execute()
+            messages = results.get('messages', [])
+            if not messages:
+                return None, "No emails found."
+
+            message = self.service.users().messages().get(userId='me', id=messages[0]['id']).execute()
+            headers = message.get('payload', {}).get('headers', [])
+            sender = next((header['value'] for header in headers if header['name'] == 'From'), "Unknown sender")
+            snippet = message.get('snippet', '')
+            return sender, snippet
+        except Exception as e:
+            print(f"Error fetching the last email: {e}")
+            return None, "Error fetching the last email."
 
 class CalendarHandler:
     @staticmethod
@@ -105,7 +151,15 @@ class WebBrowserHandler:
         """Handle website opening commands."""
         websites = {
             "youtube": "https://www.youtube.com",
-            "google": "https://www.google.com"
+            "google": "https://www.google.com",
+            "facebook": "https://www.facebook.com",
+            "twitter": "https://www.twitter.com",
+            "instagram": "https://www.instagram.com",
+            "linkedin": "https://www.linkedin.com",
+            "amazon": "https://www.amazon.com",
+            "reddit": "https://www.reddit.com",
+            "github": "https://www.github.com",
+            "stackoverflow": "https://stackoverflow.com"
         }
         
         for site, url in websites.items():
@@ -115,12 +169,12 @@ class WebBrowserHandler:
         return "I'm not sure which website to open."
 
 class ConversationalAI:
-    def __init__(self, model_path: str):
+    def __init__(self):
         self.speech_handler = SpeechHandler()
-        self.llama_handler = LlamaHandler(model_path)
+        self.huggingface_handler = HuggingFaceHandler()
         self.calendar_handler = CalendarHandler()
         self.web_handler = WebBrowserHandler()
-        self.conversation_context = {}
+        self.gmail_handler = GmailHandler()
 
     def handle_schedule_event(self) -> None:
         """Handle event scheduling conversation flow."""
@@ -147,39 +201,27 @@ class ConversationalAI:
                 continue
 
             if "exit" in command or "bye" in command:
-                response = self.llama_handler.generate_response("User said goodbye.")
+                response = self.huggingface_handler.generate_response("Goodbye!")
                 self.speech_handler.speak(response)
                 break
 
-            # Command handling
-            if "hello" in command or "hi" in command:
-                response = self.llama_handler.generate_response("User said hello.")
-                self.speech_handler.speak(response)
+            if "summarize my last email" in command:
+                self.speech_handler.speak("Fetching your last email...")
+                sender, last_email = self.gmail_handler.fetch_last_email()
+                if last_email and "Error" not in last_email:
+                    summary = self.huggingface_handler.summarize_email(last_email, sender)
+                    self.speech_handler.speak(f"The summary of your last email from {sender} is: {summary}")
+                else:
+                    self.speech_handler.speak(last_email)
+                continue
 
-            elif "summarize" in command and "email" in command:
-                email_content = "This is an example email content for summarization."
-                summary = self.llama_handler.summarize_email(email_content)
-                self.speech_handler.speak(f"The summary is: {summary}")
-
-            elif "schedule" in command and "event" in command:
-                self.handle_schedule_event()
-
-            elif "open" in command:
-                result = self.web_handler.open_website(command)
-                self.speech_handler.speak(result)
-
-            else:
-                response = self.llama_handler.generate_response(f"User said: {command}")
-                self.speech_handler.speak(response)
+            # Handle other user commands dynamically
+            response = self.huggingface_handler.generate_response(command)
+            self.speech_handler.speak(response)
 
 def main():
     try:
-        config = Config.load_config()
-        model_path = config.get("LLAMA_MODEL_PATH")
-        if not model_path:
-            raise Exception("LLAMA_MODEL_PATH not found in config file")
-            
-        ai_agent = ConversationalAI(model_path)
+        ai_agent = ConversationalAI()
         ai_agent.run()
     except Exception as e:
         print(f"Error initializing the AI agent: {e}")
