@@ -1,2 +1,4 @@
 env/
 req_clean.py
+credentials.json
+openapi_key.json
